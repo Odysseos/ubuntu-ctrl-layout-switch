@@ -10,11 +10,10 @@ from test_ctrl_layout import app
 
 
 class TerminalDialog(unittest.TestCase):
-    def dialog(self, answers, expected, hint="[д/Н]"):
+    def dialog(self, answers, expected):
         pid, fd = pty.fork()
         if pid == 0:
             try:
-                app.confirmation_hint = lambda: hint
                 print("RESULT=" + str(app.ask_add_keyboard()), flush=True)
                 os._exit(0)
             except BaseException:
@@ -24,7 +23,7 @@ class TerminalDialog(unittest.TestCase):
                 os._exit(1)
         output = b""
         pending = iter(answers)
-        prompt = ("Добавить ещё клавиатуру? " + hint + ": ").encode()
+        prompt = "Добавить ещё клавиатуру? [y/N · д/Н]: ".encode()
         seen = 0
         try:
             while True:
@@ -58,19 +57,19 @@ class TerminalDialog(unittest.TestCase):
                 pass
 
     def test_english_yes(self):
-        self.dialog(["y"], True, "[y/N]")
+        self.dialog(["y"], True)
 
     def test_english_no(self):
-        self.dialog(["n"], False, "[y/N]")
+        self.dialog(["n"], False)
 
     def test_english_in_russian(self):
         self.dialog(["YES"], True)
 
     def test_russian_in_english(self):
-        self.dialog(["нет"], False, "[y/N]")
+        self.dialog(["нет"], False)
 
     def test_unknown_layout(self):
-        self.dialog(["n"], False, "[y/N · д/Н]")
+        self.dialog(["n"], False)
 
     def test_yes(self):
         self.dialog(["д"], True)

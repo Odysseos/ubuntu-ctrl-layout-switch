@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Manage Ctrl-release layout selection in Ubuntu GNOME Wayland sessions."""
+"""Manage modifier-release layout selection in Ubuntu GNOME Wayland sessions."""
 
 import base64
 import ctypes
@@ -51,6 +51,26 @@ xkb_symbols "conditional" {
 }
 
 
+DEFAULT_KEYS = ("leftcontrol", "rightcontrol")
+KEY_LAYERS = {
+    "leftcontrol": "control",
+    "rightcontrol": "control",
+    "leftshift": "shift",
+    "rightshift": "shift",
+    "leftalt": "alt",
+    "rightalt": "altgr",
+    "leftmeta": "meta",
+    "rightmeta": "meta",
+}
+
+
+def selected_keys(first, second, current=DEFAULT_KEYS):
+    keys = (first or current[0], second or current[1])
+    if any(key not in KEY_LAYERS for key in keys) or keys[0] == keys[1]:
+        raise ValueError("Для двух раскладок нужны две разные поддерживаемые клавиши.")
+    return keys
+
+
 def run_command(*args):
     subprocess.run(args, check=True)
 
@@ -95,23 +115,88 @@ def save_state(record):
 
 
 def write_keyd_config(value):
+    write_config_file(keyd_config_path, value)
+
+
+def write_config_file(path, value):
+    """Write a single owned keyd configuration."""
     if value is None:
-        if keyd_config_path.exists():
-            run_command("sudo", "rm", "--", str(keyd_config_path))
+        if path.exists():
+            run_command("sudo", "rm", "--", str(path))
     else:
         with tempfile.NamedTemporaryFile(
             mode="w", dir=state_directory
         ) as temporary_file:
             temporary_file.write(value)
             temporary_file.flush()
-            run_command(
-                "sudo",
-                "install",
-                "-m",
-                "644",
-                temporary_file.name,
-                str(keyd_config_path),
-            )
+            run_command("sudo", "install", "-m", "644", temporary_file.name, str(path))
+
+
+def config_path(name):
+    if not re.fullmatch(r"ctrl-layout(?:-[0-9a-f-]+)?\.conf", name):
+        raise RuntimeError("Недопустимое имя управляемого конфига: " + name)
+    return keyd_config_path.parent / name
+
+
+def config_values(record, original=False):
+    if "configs" in record:
+        return record["configs_before" if original else "configs"]
+    return {keyd_config_path.name: record["config_before" if original else "config"]}
+
+
+def write_configs(values):
+    for name, value in values.items():
+        path = config_path(name)
+        if path == keyd_config_path:
+            write_keyd_config(value)
+        else:
+            write_config_file(path, value)
+
+
+def keyboard_profiles(record):
+    if "keyboards" in record:
+        return {device: tuple(keys) for device, keys in record["keyboards"].items()}
+    ids, keys = parse_keyd_config(record["config"])
+    return dict.fromkeys(ids, keys)
+
+
+def configure_keyboards(existing):
+    """Edit only the device the user presses; retain other device mappings."""
+    profiles = dict(existing)
+    for device, keys in profiles.items():
+        print(f"Сохранено: {device}: {keys[0]} → US, {keys[1]} → RU", flush=True)
+    while True:
+        print(
+            "На клавиатуре, которую хотите настроить, выберите свою пару клавиш.",
+            flush=True,
+        )
+        device, keys = choose_layout_keys()
+        profiles[device] = keys
+        if not ask_add_keyboard():
+            return profiles
+
+
+def with_keyboard_profiles(record, profiles):
+    """Migrate a shared config to per-device files, keeping the initial backup."""
+    result = dict(record)
+    before = dict(config_values(record, original=True))
+    configs = dict.fromkeys(config_values(record), None)
+    for device, keys in profiles.items():
+        if not re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{4}(?::[0-9a-f]+)?", device):
+            raise RuntimeError("Недопустимый ID клавиатуры: " + device)
+        name = "ctrl-layout-" + device.replace(":", "-") + ".conf"
+        # A pre-existing file with this name will be rejected by check_managed_state.
+        before.setdefault(name, None)
+        configs[name] = build_keyd_config([device], keys)
+    result.update(
+        version=3,
+        keyboards={device: list(keys) for device, keys in profiles.items()},
+        configs=configs,
+        configs_before=before,
+    )
+    result.pop("layout_keys", None)
+    result.pop("keyboard_ids", None)
+    return result
 
 
 def write_xkb_files(values):
@@ -127,12 +212,13 @@ def write_xkb_files(values):
 
 def check_managed_state(record):
     """Refuse to overwrite configuration changed outside this installer."""
-    if read_optional_text(keyd_config_path) not in (
-        None,
-        record["config"],
-        record["config_before"],
-    ):
-        raise RuntimeError("Конфиг keyd изменён вручную; перезапись отменена.")
+    for name, expected in config_values(record).items():
+        if read_optional_text(config_path(name)) not in (
+            None,
+            expected,
+            config_values(record, original=True).get(name),
+        ):
+            raise RuntimeError("Конфиг keyd изменён вручную: " + name)
     for name, value in FILES.items():
         if read_optional_text(xkb_directory / name) not in (
             value,
@@ -157,9 +243,11 @@ def check_managed_state(record):
 
 def refresh_keyd(record, restore=False):
     others = [
-        p for p in keyd_config_path.parent.glob("*.conf") if p != keyd_config_path
+        p
+        for p in keyd_config_path.parent.glob("*.conf")
+        if p.name not in config_values(record)
     ]
-    if keyd_config_path.exists() or others:
+    if any(config_path(name).exists() for name in config_values(record)) or others:
         run_command("sudo", "systemctl", "start", "keyd")
         run_command("sudo", find_keyd_binary(), "reload")
     else:
@@ -231,73 +319,145 @@ def validate_xkb(record):
                 raise RuntimeError("Обнаружено прямое переключение XKB")
 
 
-def parse_keyboard_ids(text):
+def parse_keyd_config(text):
+    """Recognize only configurations produced by this installer."""
     if text is None:
-        return []
-    match = re.fullmatch(
-        r"\s*\[ids\]\s*\n(.*?)\n\[global\]\s*\noverload_tap_timeout\s*=\s*0\s*\n\[main\]\s*\nleftcontrol\s*=\s*overload\(control,\s*f13\)\s*\nrightcontrol\s*=\s*overload\(control,\s*f14\)\s*",
-        text,
-        re.DOTALL,
+        return [], DEFAULT_KEYS
+    header = re.match(r"\s*\[ids\]\s*\n(.*?)\n\[global\]", text, re.DOTALL)
+    bindings = re.findall(
+        r"^(\w+)\s*=\s*overload\(\w+,\s*f(13|14)\)\s*$", text, re.MULTILINE
     )
-    if not match:
+    if (
+        not header
+        or len(bindings) != 2
+        or {number for _, number in bindings} != {"13", "14"}
+    ):
         raise RuntimeError(
-            "Существующий конфиг не соответствует управляемому назначению Ctrl."
+            "Существующий конфиг не соответствует управляемым назначениям."
         )
-    keyboard_ids = match[1].split()
-    if not keyboard_ids or any(
-        not re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{4}(?::[0-9a-fA-F]+)?", v)
-        for v in keyboard_ids
+    by_target = {number: key for key, number in bindings}
+    try:
+        keys = selected_keys(by_target["13"], by_target["14"])
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
+    ids = header[1].split()
+    if not ids or any(
+        not re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{4}(?::[0-9a-fA-F]+)?", key)
+        for key in ids
     ):
         raise RuntimeError("В конфиге ожидаются явные ID клавиатур.")
-    return list(dict.fromkeys(v.lower() for v in keyboard_ids))
+    if re.sub(r"\s+", "", text) != re.sub(r"\s+", "", build_keyd_config(ids, keys)):
+        raise RuntimeError("Конфиг содержит посторонние настройки или неверные слои.")
+    return list(dict.fromkeys(key.lower() for key in ids)), keys
 
 
-def build_keyd_config(keyboard_ids):
-    return (
-        "[ids]\n"
-        + "\n".join(keyboard_ids)
-        + "\n\n[global]\noverload_tap_timeout = 0\n\n[main]\nleftcontrol = overload(control, f13)\nrightcontrol = overload(control, f14)\n"
+def parse_keyboard_ids(text):
+    return parse_keyd_config(text)[0]
+
+
+def build_keyd_config(keyboard_ids, keys=DEFAULT_KEYS):
+    keys = selected_keys(*keys)
+    config = "[ids]\n" + "\n".join(keyboard_ids)
+    config += "\n\n[global]\noverload_tap_timeout = 0\n\n[main]\n"
+    for key, target in zip(keys, ("f13", "f14")):
+        config += f"{key} = overload({KEY_LAYERS[key]}, {target})\n"
+    return config
+
+
+def capture_layout_keys(keyd_binary):
+    """Capture two distinct supported keys, with complete down/up pairs."""
+    print(
+        "Нажмите и отпустите клавишу для первой раскладки (US). "
+        "Поддерживаются Ctrl, Shift, Alt, Windows/Super с любой стороны. Ctrl+C — отмена.",
+        flush=True,
     )
+    process = subprocess.Popen(
+        ["sudo", "stdbuf", "-oL", keyd_binary, "monitor"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    selected = []
+    selected_device = None
+    pending = None
+    held = set()
+    try:
+        for line in process.stdout:
+            match = re.search(
+                r"^(.*?)\s+([0-9a-fA-F]{4}:[0-9a-fA-F]{4}(?::[0-9a-fA-F]+)?)\s+(\S+)\s+(down|up)\s*$",
+                line,
+            )
+            if not match:
+                continue
+            name, device, key, event = match.groups()
+            device = device.lower()
+            if device.startswith("0fac:") or "virtual" in name.lower():
+                raise RuntimeError(
+                    "Получено виртуальное устройство вместо физической клавиатуры."
+                )
+            token = (device, key)
+            if event == "down":
+                if token in held:
+                    continue
+                held.add(token)
+                if len(held) != 1:
+                    pending = None
+                    print("Отпустите все клавиши и нажмите одну отдельно.", flush=True)
+                elif key not in KEY_LAYERS:
+                    pending = None
+                    print(
+                        f"Клавиша {key} не поддерживается. Выберите Ctrl, Shift, Alt, Windows/Super.",
+                        flush=True,
+                    )
+                elif selected_device and device != selected_device:
+                    pending = None
+                    print("Выберите вторую клавишу на той же клавиатуре.", flush=True)
+                else:
+                    pending = token
+                continue
+            held.discard(token)
+            if pending != token:
+                continue
+            pending = None
+            if key in selected:
+                print(
+                    "Эта клавиша уже назначена первой раскладке. Нажмите другую.",
+                    flush=True,
+                )
+                continue
+            selected_device = device
+            selected.append(key)
+            if len(selected) == 2:
+                print(
+                    f"Выбрано: {selected[0]} → US, {selected[1]} → RU ({device}).",
+                    flush=True,
+                )
+                return device, tuple(selected)
+            print(
+                f"Первая клавиша: {key}. Нажмите и отпустите другую клавишу для второй раскладки (RU).",
+                flush=True,
+            )
+        raise RuntimeError("Монитор завершился до выбора двух клавиш.")
+    finally:
+        process.terminate()
+        process.wait()
+
+
+def choose_layout_keys():
+    """Temporarily release keyd's grab to observe the physical keys."""
+    running = is_keyd_active()
+    try:
+        if running:
+            run_command("sudo", "systemctl", "stop", "keyd")
+        return capture_layout_keys(find_keyd_binary())
+    finally:
+        if running:
+            run_command("sudo", "systemctl", "start", "keyd")
 
 
 def confirmation_hint():
-    """Choose the hint from the current Xwayland keyboard group."""
-    # Read the active XKB group mirrored by Mutter into Xwayland.
-    # Do not infer the input language from locale or the (possibly locked) MRU.
-    try:
-        x11 = ctypes.CDLL("libX11.so.6")
-        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
-        x11.XOpenDisplay.restype = ctypes.c_void_p
-        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
-        x11.XkbGetState.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p]
-        x11.XkbGetState.restype = ctypes.c_int
-        x11.XkbKeycodeToKeysym.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_ubyte,
-            ctypes.c_int,
-            ctypes.c_int,
-        ]
-        x11.XkbKeycodeToKeysym.restype = ctypes.c_ulong
-        display = x11.XOpenDisplay(None)
-        if not display:
-            return "[y/N · д/Н]"
-        try:
-            # XkbStateRec begins with unsigned char group; reserve aligned storage
-            # larger than the complete public structure to receive all fields.
-            keyboard_state = (ctypes.c_ulong * 8)()
-            if x11.XkbGetState(display, 0x100, ctypes.byref(keyboard_state)) != 0:
-                return "[y/N · д/Н]"
-            group = ctypes.cast(keyboard_state, ctypes.POINTER(ctypes.c_ubyte))[0]
-            symbol = x11.XkbKeycodeToKeysym(display, 24, group, 0)
-            if symbol == 0x71:
-                return "[y/N]"  # q in the US layout
-            if symbol in (0x6CA, 0x1000439):
-                return "[д/Н]"  # й in RU
-            return "[y/N · д/Н]"
-        finally:
-            x11.XCloseDisplay(display)
-    except (OSError, AttributeError):
-        return "[y/N · д/Н]"
+    """Accept both languages without relying on Xwayland's keyboard state."""
+    return "[y/N · д/Н]"
 
 
 def ask_add_keyboard():
@@ -316,98 +476,23 @@ def ask_add_keyboard():
                 return True
 
 
-def collect_keyboards(existing):
-    """Collect unique device IDs and restore the previously running service."""
-    keyboard_ids = list(existing)
-    if keyboard_ids:
-        print("Уже настроены: " + ", ".join(keyboard_ids), flush=True)
-        if not ask_add_keyboard():
-            return keyboard_ids
-    running = is_keyd_active()
-    try:
-        if running:
-            run_command("sudo", "systemctl", "stop", "keyd")
-        while True:
-            print(
-                "На добавляемой клавиатуре нажмите и отпустите левый, затем правый Ctrl.",
-                flush=True,
-            )
-            monitor_keyboard(
-                find_keyd_binary(), state_directory / "detected-keyboard-id"
-            )
-            device = (
-                (state_directory / "detected-keyboard-id").read_text().strip().lower()
-            )
-            if device not in keyboard_ids:
-                keyboard_ids.append(device)
-            else:
-                print("Эта клавиатура уже есть в списке.")
-            if not ask_add_keyboard():
-                return keyboard_ids
-    finally:
-        if running:
-            run_command("sudo", "systemctl", "start", "keyd")
-
-
-def monitor_keyboard(keyd_binary, target):
-    """Identify a physical keyboard from both Ctrl press/release pairs."""
-    # stdbuf makes a pipe event-driven; no polling or time-based detection.
-    process = subprocess.Popen(
-        ["sudo", "stdbuf", "-oL", keyd_binary, "monitor"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    chosen = None
-    pressed = set()
-    released = set()
-    try:
-        for line in process.stdout:
-            match = re.search(
-                r"^(.*?)\s+([0-9a-fA-F]{4}:[0-9a-fA-F]{4}(?::[0-9a-fA-F]+)?)\s+(leftcontrol|rightcontrol)\s+(down|up)\s*$",
-                line,
-            )
-            if not match:
-                continue
-            name, device, key, event = match.groups()
-            if device.startswith("0fac:") or "virtual" in name.lower():
-                print(
-                    "Получено виртуальное устройство. Остановите keyd и повторите установку.",
-                    flush=True,
-                )
-                raise SystemExit(1)
-            if chosen and chosen != device:
-                print(
-                    "Ctrl нажаты на разных устройствах. Повторите оба на одной клавиатуре.",
-                    flush=True,
-                )
-                pressed.clear()
-                released.clear()
-            chosen = device
-            if event == "down":
-                pressed.add(key)
-            elif key in pressed:
-                released.add(key)
-                print(f"{name.strip()}: {device}, {key} подтверждён", flush=True)
-            if released == {"leftcontrol", "rightcontrol"}:
-                with open(str(target), "w") as output_file:
-                    output_file.write(device + "\n")
-                break
-        else:
-            raise SystemExit("Монитор завершился без определения клавиатуры.")
-    finally:
-        process.terminate()
-        process.wait()
-
-
 def enable(record, previous=None):
     """Apply the managed configuration, rolling back on failure."""
-    check_managed_state(previous if previous is not None else record)
+    baseline = previous if previous is not None else record
+    check_managed_state(baseline)
+    for name in config_values(record).keys() - config_values(baseline).keys():
+        if config_path(name).exists():
+            raise RuntimeError(
+                "Файл уже существует и не принадлежит установке: " + name
+            )
     for key in ("sources", "xkb-options"):
         if not settings.is_writable(key):
             raise RuntimeError("Настройка заблокирована: " + key)
     snapshot = {
-        "config": read_optional_text(keyd_config_path),
+        "configs": {
+            name: read_optional_text(config_path(name))
+            for name in config_values(record)
+        },
         "files": {n: read_optional_text(xkb_directory / n) for n in FILES},
         "options": list(get_setting("xkb-options")),
         "sources": get_setting("sources"),
@@ -422,13 +507,13 @@ def enable(record, previous=None):
         validate_xkb(record)
         set_setting("sources", SOURCES)
         set_setting("xkb-options", record["options"])
-        write_keyd_config(record["config"])
+        write_configs(config_values(record))
         run_command("sudo", "systemctl", "enable", "--now", "keyd")
         run_command("sudo", find_keyd_binary(), "reload")
         record["enabled"] = True
         save_state(record)
     except BaseException:
-        write_keyd_config(snapshot["config"])
+        write_configs(snapshot["configs"])
         write_xkb_files(snapshot["files"])
         set_setting("sources", snapshot["sources"])
         set_setting("xkb-options", snapshot["options"])
@@ -444,13 +529,18 @@ def enable(record, previous=None):
             "keyd",
         )
         raise
-    print("Включено: отпускание левого Ctrl → EN, правого → RU, с индикатором GNOME.")
+    for device, keys in keyboard_profiles(record).items():
+        print(f"Включено: {device}: {keys[0]} → EN, {keys[1]} → RU по отпусканию.")
 
 
 def disable(record, uninstall=False):
     """Disable mappings or restore the original installation baseline."""
     check_managed_state(record)
-    write_keyd_config(record["config_before"] if uninstall else None)
+    write_configs(
+        config_values(record, original=True)
+        if uninstall
+        else dict.fromkeys(config_values(record), None)
+    )
     write_xkb_files(record["files_before"])
     set_setting("xkb-options", record["options_before"])
     set_setting("sources", record["sources_before"])
@@ -463,7 +553,7 @@ def disable(record, uninstall=False):
             "Удалено. Исходные настройки восстановлены. Пакет keyd оставлен установленным."
         )
     else:
-        print("Переключение одиночными Ctrl отключено.")
+        print("Переключение одиночными клавишами отключено.")
 
 
 def check_environment():
@@ -542,9 +632,10 @@ def prepare_installation():
         if original
         else None
     )
-    keyboard_ids = parse_keyboard_ids(legacy)
-    keyboard_ids = collect_keyboards(keyboard_ids)
-    config = build_keyd_config(keyboard_ids)
+    keyboard_ids, keys = parse_keyd_config(legacy)
+    profiles = configure_keyboards(dict.fromkeys(keyboard_ids, keys))
+    # Keep the original single-file state until the multi-file transaction succeeds.
+    config = original
     record = {
         "version": 2,
         "config": config,
@@ -564,7 +655,7 @@ def prepare_installation():
     if migration.exists():
         record["config"] = test["config_after"]
     save_state(record)
-    return record, config
+    return record, profiles
 
 
 def main(argv=None):
@@ -572,6 +663,8 @@ def main(argv=None):
     global settings
     arguments = sys.argv[1:] if argv is None else argv
     action = arguments[0] if arguments else "install"
+    if len(arguments) > 1:
+        raise SystemExit("Клавиши выбираются нажатием в диалоге, без параметров.")
     if os.geteuid() == 0:
         raise SystemExit("Запускайте обычным пользователем, без sudo.")
     if action not in ("install", "--enable", "--disable", "--uninstall"):
@@ -581,25 +674,21 @@ def main(argv=None):
     if action in ("install", "--enable"):
         check_environment()
     run_command("sudo", "-v")
-    pending_config = None
+    pending_profiles = None
     if state_file.exists():
         record = json.loads(state_file.read_text())
     else:
         if action != "install":
             raise SystemExit("Сначала запустите install.sh")
-        record, pending_config = prepare_installation()
+        record, pending_profiles = prepare_installation()
     if action in ("install", "--enable"):
         check_managed_state(record)
         previous = record
         if action == "install":
-            config = pending_config
-            if config is None:
-                config = build_keyd_config(
-                    collect_keyboards(parse_keyboard_ids(record["config"]))
-                )
-            record = dict(
-                record, config=config, keyboard_ids=parse_keyboard_ids(config)
-            )
+            profiles = pending_profiles
+            if profiles is None:
+                profiles = configure_keyboards(keyboard_profiles(record))
+            record = with_keyboard_profiles(record, profiles)
         enable(record, previous)
         migration = test_state_directory / "backup.json"
         if migration.exists():

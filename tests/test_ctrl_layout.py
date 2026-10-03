@@ -104,14 +104,14 @@ class IsolatedCase(unittest.TestCase):
         }
 
     def use_local_config_writer(self):
-        def write(value):
+        def write(path, value):
             if value is None:
-                self.config.unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
             else:
-                self.config.write_text(value)
+                path.write_text(value)
 
         self.stack.enter_context(
-            patch.object(app, "write_keyd_config", side_effect=write)
+            patch.object(app, "write_config_file", side_effect=write)
         )
 
 
@@ -177,6 +177,11 @@ class LifecycleTests(IsolatedCase):
     def setUp(self):
         super().setUp()
         self.use_local_config_writer()
+        self.stack.enter_context(
+            patch.object(
+                app, "choose_layout_keys", return_value=(EXTERNAL, app.DEFAULT_KEYS)
+            )
+        )
         self.validation = self.stack.enter_context(patch.object(app, "validate_xkb"))
 
     def test_enable_disable_reenable_uninstall(self):
@@ -249,10 +254,17 @@ class LifecycleTests(IsolatedCase):
         )
 
     def test_initial_installation(self):
-        with patch.object(app, "collect_keyboards", return_value=[EXTERNAL, INTERNAL]):
+        with patch.object(
+            app,
+            "configure_keyboards",
+            return_value={
+                EXTERNAL: app.DEFAULT_KEYS,
+                INTERNAL: ("leftcontrol", "rightshift"),
+            },
+        ):
             record, config = app.prepare_installation()
         self.assertIsNone(record["config_before"])
-        self.assertEqual(app.parse_keyboard_ids(config), [EXTERNAL, INTERNAL])
+        self.assertEqual(list(config), [EXTERNAL, INTERNAL])
         self.assertEqual(json.loads(app.state_file.read_text()), record)
 
     def test_adopt_installation_without_history(self):
@@ -260,7 +272,14 @@ class LifecycleTests(IsolatedCase):
         self.config.write_text(original)
         app.write_xkb_files(app.FILES)
         self.settings.values["xkb-options"] = ["grp:menu_toggle", app.OPTION]
-        with patch.object(app, "collect_keyboards", return_value=[EXTERNAL, INTERNAL]):
+        with patch.object(
+            app,
+            "configure_keyboards",
+            return_value={
+                EXTERNAL: app.DEFAULT_KEYS,
+                INTERNAL: ("leftcontrol", "rightshift"),
+            },
+        ):
             record, config = app.prepare_installation()
         self.assertEqual(record["config_before"], original)
         self.assertEqual(record["files_before"], app.FILES)
@@ -282,18 +301,25 @@ class LifecycleTests(IsolatedCase):
                 }
             )
         )
-        with patch.object(app, "collect_keyboards", return_value=[EXTERNAL, INTERNAL]):
+        with patch.object(
+            app,
+            "configure_keyboards",
+            return_value={
+                EXTERNAL: app.DEFAULT_KEYS,
+                INTERNAL: ("leftcontrol", "rightshift"),
+            },
+        ):
             record, config = app.prepare_installation()
         self.assertEqual(record["options_before"], [])
         self.assertTrue(all(value is None for value in record["files_before"].values()))
-        self.assertEqual(app.parse_keyboard_ids(config), [EXTERNAL, INTERNAL])
+        self.assertEqual(list(config), [EXTERNAL, INTERNAL])
 
     def test_main_enable_does_not_collect_keyboards(self):
         app.save_state(self.record())
         with patch.object(app.os, "geteuid", return_value=1000), patch.object(
             app, "check_environment"
         ), patch.object(
-            app, "collect_keyboards", side_effect=AssertionError("Unexpected prompt")
+            app, "configure_keyboards", side_effect=AssertionError("Unexpected prompt")
         ):
             app.main(["--enable"])
         self.assertTrue(self.config.exists())
@@ -308,111 +334,13 @@ class LifecycleTests(IsolatedCase):
         self.gio.bus_get_sync.assert_not_called()
 
 
-class MonitorTests(IsolatedCase):
-    def event(self, device, key, event, name="Keyboard"):
-        return f"{name}\t{device}\t{key} {event}\n"
-
-    def pair(self, device, key):
-        return self.event(device, key, "down") + self.event(device, key, "up")
-
-    def monitor(self, output, succeeds=True):
-        process = Mock(stdout=io.StringIO(output))
-        target = self.state / "detected"
-        with patch.object(app.subprocess, "Popen", return_value=process):
-            if succeeds:
-                app.monitor_keyboard("/usr/bin/keyd", target)
-            else:
-                with self.assertRaises(SystemExit):
-                    app.monitor_keyboard("/usr/bin/keyd", target)
-        process.terminate.assert_called_once()
-        process.wait.assert_called_once()
-        return target
-
-    def test_both_ctrl_pairs_choose_device(self):
-        target = self.monitor(
-            "device added: noise\n"
-            + self.pair(EXTERNAL, "leftcontrol")
-            + self.pair(EXTERNAL, "rightcontrol")
-        )
-        self.assertEqual(target.read_text().strip(), EXTERNAL)
-
-    def test_release_without_press_is_not_confirmation(self):
-        self.monitor(
-            self.event(EXTERNAL, "leftcontrol", "up")
-            + self.pair(EXTERNAL, "rightcontrol"),
-            False,
-        )
-
-    def test_pairs_on_different_devices_are_not_combined(self):
-        self.monitor(
-            self.pair(EXTERNAL, "leftcontrol") + self.pair(INTERNAL, "rightcontrol"),
-            False,
-        )
-
-    def test_new_device_can_complete_both_pairs(self):
-        target = self.monitor(
-            self.pair(EXTERNAL, "leftcontrol")
-            + self.pair(INTERNAL, "rightcontrol")
-            + self.pair(INTERNAL, "leftcontrol")
-        )
-        self.assertEqual(target.read_text().strip(), INTERNAL)
-
-    def test_virtual_device_rejected(self):
-        self.monitor(
-            self.event(
-                "0fac:0ade:efba1ddf", "leftcontrol", "down", "keyd virtual keyboard"
-            ),
-            False,
-        )
-
-    def test_eof_without_events_fails(self):
-        self.assertFalse(self.monitor("", False).exists())
-
-    def test_collect_deduplicates_devices(self):
-        devices = iter([EXTERNAL.upper(), INTERNAL])
-
-        def monitor(binary, target):
-            target.write_text(next(devices))
-
-        with patch.object(
-            app, "ask_add_keyboard", side_effect=[True, True, False]
-        ), patch.object(app, "monitor_keyboard", side_effect=monitor):
-            result = app.collect_keyboards([EXTERNAL])
-        self.assertEqual(result, [EXTERNAL, INTERNAL])
-        self.assertEqual(
-            self.commands.call_args_list[-1], call("sudo", "systemctl", "start", "keyd")
-        )
-
-    def test_cancel_restores_running_service(self):
-        with patch.object(
-            app, "monitor_keyboard", side_effect=KeyboardInterrupt
-        ), self.assertRaises(KeyboardInterrupt):
-            app.collect_keyboards([])
-        self.assertEqual(
-            self.commands.call_args_list[-1], call("sudo", "systemctl", "start", "keyd")
-        )
-
-
 class HintTests(unittest.TestCase):
-    def test_missing_x11_uses_both_languages(self):
-        with patch.object(app.ctypes, "CDLL", side_effect=OSError):
-            self.assertEqual(app.confirmation_hint(), "[y/N · д/Н]")
-
-    def test_keysyms_and_display_cleanup(self):
-        for symbol, expected in (
-            (0x71, "[y/N]"),
-            (0x6CA, "[д/Н]"),
-            (0x1000439, "[д/Н]"),
-            (0, "[y/N · д/Н]"),
+    def test_hint_never_queries_xwayland(self):
+        with patch.object(
+            app.ctypes, "CDLL", side_effect=AssertionError("Unexpected layout query")
         ):
-            with self.subTest(symbol=symbol):
-                library = Mock()
-                library.XOpenDisplay.return_value = 1
-                library.XkbGetState.return_value = 0
-                library.XkbKeycodeToKeysym.return_value = symbol
-                with patch.object(app.ctypes, "CDLL", return_value=library):
-                    self.assertEqual(app.confirmation_hint(), expected)
-                library.XCloseDisplay.assert_called_once_with(1)
+            self.assertEqual(app.confirmation_hint(), "[y/N · д/Н]")
+            self.assertEqual(app.confirmation_hint(), "[y/N · д/Н]")
 
 
 class XkbIntegrationTests(IsolatedCase):
